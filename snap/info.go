@@ -21,6 +21,7 @@ package snap
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/url"
@@ -35,6 +36,7 @@ import (
 	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/osutil/sys"
 	"github.com/snapcore/snapd/snap/naming"
+	"github.com/snapcore/snapd/snapdtool"
 	"github.com/snapcore/snapd/strutil"
 	"github.com/snapcore/snapd/timeout"
 )
@@ -358,6 +360,9 @@ type Info struct {
 
 	// OriginalLinks is a map links keys to link lists
 	OriginalLinks map[string][]string
+
+	// Categories this snap is in.
+	Categories []CategoryInfo
 }
 
 // StoreAccount holds information about a store account, for example of snap
@@ -1087,6 +1092,11 @@ type SystemUsernameInfo struct {
 	Attrs map[string]interface{}
 }
 
+type CategoryInfo struct {
+	Name     string `json:"name"`
+	Featured bool   `json:"featured"`
+}
+
 // File returns the path to the *.socket file
 func (socket *SocketInfo) File() string {
 	return filepath.Join(socket.App.serviceDir(), socket.App.SecurityTag()+"."+socket.Name+".socket")
@@ -1285,7 +1295,13 @@ var SanitizePlugsSlots = func(snapInfo *Info) {
 // ReadInfo reads the snap information for the installed snap with the given
 // name and given side-info.
 func ReadInfo(name string, si *SideInfo) (*Info, error) {
-	snapYamlFn := filepath.Join(MountDir(name, si.Revision), "meta", "snap.yaml")
+	return ReadInfoFromMountPoint(name, MountDir(name, si.Revision), MountFile(name, si.Revision), si)
+}
+
+// ReadInfoFromMountPoint reads the snap information for a mounted
+// snap given the mound point, mount file, and side info.
+func ReadInfoFromMountPoint(name, mountPoint, mountFile string, si *SideInfo) (*Info, error) {
+	snapYamlFn := filepath.Join(mountPoint, "meta", "snap.yaml")
 	meta, err := ioutil.ReadFile(snapYamlFn)
 	if os.IsNotExist(err) {
 		return nil, &NotFoundError{Snap: name, Revision: si.Revision, Path: snapYamlFn}
@@ -1303,14 +1319,14 @@ func ReadInfo(name string, si *SideInfo) (*Info, error) {
 	_, instanceKey := SplitInstanceName(name)
 	info.InstanceKey = instanceKey
 
-	err = addImplicitHooks(info)
+	hooksDir := filepath.Join(mountPoint, "meta", "hooks")
+	err = addImplicitHooks(info, hooksDir)
 	if err != nil {
 		return nil, &invalidMetaError{Snap: name, Revision: si.Revision, Msg: err.Error()}
 	}
 
 	bindImplicitHooks(info, strk)
 
-	mountFile := MountFile(name, si.Revision)
 	st, err := os.Lstat(mountFile)
 	if os.IsNotExist(err) {
 		// This can happen when "snap try" mode snap is moved around. The mount
@@ -1545,4 +1561,86 @@ func (a AppInfoBySnapApp) Less(i, j int) bool {
 		return a[i].Name < a[j].Name
 	}
 	return iName < jName
+}
+
+// SnapdAssertionMaxFormatsFromSnapFile returns the supported assertion max
+// formats for the snapd code carried by the given snap, plus its snapd
+// version. This is only applicable to snapd/core or UC20+ kernel snaps.
+// For kernel snaps that are not UC20+ or that do not carry the necessary
+// explicit information yes, this can return nil and "" respectively for
+// maxFormats and snapdVersion.
+func SnapdAssertionMaxFormatsFromSnapFile(snapf Container) (maxFormats map[string]int, snapdVersion string, err error) {
+	info, err := ReadInfoFromSnapFile(snapf, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	var infoFile string
+	missingOK := false
+	typ := info.Type()
+	switch typ {
+	case TypeOS, TypeSnapd:
+		infoFile = "/usr/lib/snapd/info"
+	case TypeKernel:
+		infoFile = "/snapd-info"
+		// some old kernel file will not contain this
+		missingOK = true
+	default:
+		return nil, "", fmt.Errorf("cannot extract assertion max formats information, snaps of type %s do not carry snapd", typ)
+	}
+	b, err := snapf.ReadFile(infoFile)
+	if err != nil {
+		if missingOK && os.IsNotExist(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+	ver, flags, err := snapdtool.ParseInfoFile(bytes.NewBuffer(b), fmt.Sprintf("from %s snap", typ))
+	if err != nil {
+		return nil, "", err
+	}
+	if fmts := flags["SNAPD_ASSERTS_FORMATS"]; fmts != "" {
+		err := json.Unmarshal([]byte(strings.Trim(fmts, "'")), &maxFormats)
+		if err != nil {
+			return nil, "", fmt.Errorf("cannot unmarshal SNAPD_ASSERTS_FORMATS from info file from %s snap", typ)
+		}
+		return maxFormats, ver, nil
+	}
+	// use version
+	sysUser := 0
+	cmp, err := strutil.VersionCompare(ver, "2.46")
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid snapd version in info file from %s snap: %v", typ, err)
+	}
+	if cmp >= 0 {
+		sysUser = 1
+	}
+	snapDecl := 0
+	for _, mapping := range verToSnapDecl {
+		// ignoring error as we validated the version before
+		if cmp, _ := strutil.VersionCompare(ver, mapping.ver); cmp >= 0 {
+			snapDecl = mapping.format
+			break
+		}
+	}
+	maxFormats = make(map[string]int)
+	if sysUser > 0 {
+		maxFormats["system-user"] = sysUser
+	}
+	if snapDecl > 0 {
+		maxFormats["snap-declaration"] = snapDecl
+	}
+	return maxFormats, ver, nil
+}
+
+var verToSnapDecl = []struct {
+	ver    string
+	format int
+}{
+	{"2.54", 5},
+	{"2.44", 4},
+	{"2.36", 3},
+	// old
+	{"2.23", 2},
+	// ancient
+	{"2.17", 1},
 }
